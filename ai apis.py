@@ -20,11 +20,14 @@ CODE_BG = "#1a1a1a"
 CODE_FG = "#0088ff"
 HEADING_FG = "#00ffaa"
 
+# API Key
+API_KEY = "sk-lm-J6JKbAiq:eq3B92fGGwdIneldysVH"
+
 # Store raw content for toggling
 response_content = {"left": "", "right": ""}
 show_formatted = {"left": True, "right": True}
 loaded_models = {"left": None, "right": None}
-selected_models = {"left": 0, "right": 1}  # Track selections separately
+selected_models = {"left": 2, "right": 1}  # Track selections separately (left: gpt-oss, right: deepseek)
 model_instances = {"left": None, "right": None}  # Track model instance IDs
 
 available_models = [
@@ -37,8 +40,12 @@ def get_loaded_models():
     """Get list of currently loaded models."""
     endpoint = f"{BASE_URL}/api/v1/models"
     
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+    
     try:
-        response = requests.get(endpoint)
+        response = requests.get(endpoint, headers=headers)
         response.raise_for_status()
         data = response.json()
         return data.get("data", [])
@@ -50,8 +57,18 @@ def load_model(model_name):
     """Load a model in LM Studio."""
     endpoint = f"{BASE_URL}/api/v1/models/load"
     
+    # Check for and unload any duplicate instances first
+    current_models = get_loaded_models()
+    for model in current_models:
+        model_id = model.get("id") or model.get("model")
+        if model_id and model_id.startswith(model_name + ":"):
+            # Found a duplicate, unload it
+            print(f"Unloading duplicate instance: {model_id}")
+            unload_model(model_name, specific_instance=model_id)
+    
     data = {
-        "model": model_name
+        "model": model_name,
+        "flash_attention": True
     }
     
     try:
@@ -64,31 +81,65 @@ def load_model(model_name):
         print(f"Error loading model {model_name}: {e}")
         return None
 
-def unload_model(model_name):
-    """Unload a model in LM Studio."""
+def unload_model(model_name, specific_instance=None):
+    """Unload a model in LM Studio.
+    
+    Args:
+        model_name (str): The name of the model to unload.
+        specific_instance (str, optional): The specific instance ID (e.g., 'model:2') to unload.
+                                          If None, unloads the base model.
+    """
     endpoint = f"{BASE_URL}/api/v1/models/unload"
     
+    # Use specific instance if provided, otherwise use base model name
+    unload_target = specific_instance if specific_instance else model_name
+    
     data = {
-        "model": model_name
+        "model": unload_target
     }
     
     try:
         response = requests.post(endpoint, json=data)
         response.raise_for_status()
-        print(f"Model {model_name} unloaded successfully")
+        print(f"Model {unload_target} unloaded successfully")
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Error unloading model {model_name}: {e}")
+        print(f"Error unloading model {unload_target}: {e}")
         return False
 
+def remove_duplicate_instances(model_name, keep=1):
+    """Unload duplicate loaded instances of a model, keeping only `keep` instances.
+
+    This scans currently loaded models for instance ids that start with
+    "{model_name}:" and unloads extras.
+    """
+    current_models = get_loaded_models()
+    instances = []
+    for m in current_models:
+        model_id = m.get("id") or m.get("model")
+        if model_id and model_id.startswith(model_name + ":"):
+            instances.append(model_id)
+
+    # If there are more instances than desired, unload the extras
+    if len(instances) > keep:
+        # Keep the first `keep` instances and unload the rest
+        to_unload = instances[keep:]
+        for inst in to_unload:
+            print(f"Found duplicate instance for {model_name}: {inst} - unloading")
+            unload_model(model_name, specific_instance=inst)
+
 def ensure_model_loaded(model_name, side):
-    """Ensure the specified model is loaded and unload the previous one if different."""
-    if loaded_models[side] != model_name:
-        # Unload the old model if it exists
-        if loaded_models[side]:
-            unload_model(loaded_models[side])
-        
-        # Load the new model
+    """Ensure the specified model is loaded."""
+    current_models = get_loaded_models()
+    current_model_ids = [m.get("id") or m.get("model") for m in current_models]
+    
+    # Check if the model is already loaded
+    if model_name in current_model_ids:
+        # Model is already loaded, just update our tracking
+        loaded_models[side] = model_name
+        model_instances[side] = model_name
+    else:
+        # Model not loaded at all, load it
         load_result = load_model(model_name)
         if load_result:
             loaded_models[side] = model_name
@@ -114,7 +165,7 @@ def generate_text(model_name, prompt):
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer sk-lm-J6JKbAiq:eq3B92fGGwdIneldysVH"
+        "Authorization": f"Bearer {API_KEY}"
         # Add any authentication headers here if required by LM Studio
     }
 
@@ -125,28 +176,26 @@ def generate_text(model_name, prompt):
         # Add other parameters supported by LM Studio's API (e.g., top_p, frequency_penalty)
     }
 
-    try:
-        response = requests.post(endpoint, headers=headers, data=json.dumps(data))
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+    response = requests.post(endpoint, headers=headers, data=json.dumps(data))
+    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
-        response_json = response.json()
-        # Extract the message content from the 'output' array
-        message_content = None
-        model_id = response_json.get("model_id") or response_json.get("id") or model_name
-        
+    response_json = response.json()
+    # Extract the message content from the 'output' array
+    message_content = None
+    model_id = response_json.get("model_id") or response_json.get("id") or model_name
+
+    try:
         for output in response_json["output"]:
             if output["type"] == "message":
                 message_content = output["content"]
                 break  # Stop after finding the first "message" type
-        
-        return message_content, model_id
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"Error parsing response: {e}. Check LM Studio's API response format.")
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error during API request: {e}")
-        return None, None
-    except (KeyError, IndexError) as e:
-        print(f"Error parsing response: {e}.  Check LM Studio's API response format.")
-        return None, None
+    # Extract stats if present
+    stats = response_json.get("stats") or response_json.get("metrics") or None
+
+    return message_content, model_id, stats
 
 def format_markdown(text_widget, content):
     """Format and display markdown content in the text widget."""
@@ -238,6 +287,26 @@ def format_markdown(text_widget, content):
     
     text_widget.config(state=tk.DISABLED)
 
+
+def _set_widget_message(text_widget, message, side=None, error=False):
+    """Helper to set message into a widget and optionally format it.
+
+    If `side` is provided and `error` is False, the message is stored in
+    `response_content` and formatted for display. For errors, it simply
+    inserts the message.
+    """
+    text_widget.config(state=tk.NORMAL)
+    text_widget.delete(1.0, tk.END)
+    text_widget.insert(tk.END, message)
+    text_widget.config(state=tk.DISABLED)
+
+    if side and not error:
+        response_content[side] = message
+        show_formatted[side] = True
+        button = button_left if side == "left" else button_right
+        button.config(text="Show Raw")
+        format_markdown(text_widget, message)
+
 def toggle_view(side):
     """Toggle between formatted and raw markdown view."""
     show_formatted[side] = not show_formatted[side]
@@ -256,38 +325,72 @@ def toggle_view(side):
 
 def generate_for_model(model_name, prompt_text, text_widget, side, expected_model_id):
     """Generate text for a single model and update the UI."""
+    # Send the prompt immediately (fast path) and only pivot to loading/unloading on error
     try:
-        # Ensure the model is loaded
-        ensure_model_loaded(model_name, side)
-        
-        generated_text, model_id = generate_text(model_name, prompt_text)
-        
-        # Verify the response came from the correct model
-        if model_id != expected_model_id:
-            print(f"Warning: Response for {side} came from {model_id}, expected {expected_model_id}")
-            text_widget.config(state=tk.NORMAL)
-            text_widget.delete(1.0, tk.END)
-            text_widget.insert(tk.END, f"Error: Response mismatch. Expected {expected_model_id}, got {model_id}")
-            text_widget.config(state=tk.DISABLED)
+        generated_text, model_id, stats = generate_text(model_name, prompt_text)
+    except (requests.exceptions.RequestException, ValueError) as first_err:
+        # First attempt failed; pivot to ensure model is loaded and remove duplicates, then retry
+        print(f"Initial request failed for {model_name}: {first_err}. Pivoting to load/unload flow.")
+
+        # Start duplicate watcher while we attempt recovery and retry
+        stop_event = threading.Event()
+        def _duplicate_watcher():
+            while not stop_event.is_set():
+                try:
+                    remove_duplicate_instances(model_name, keep=1)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        watcher = threading.Thread(target=_duplicate_watcher, daemon=True)
+        watcher.start()
+
+        try:
+            # Ensure model is loaded (this will attempt to load if missing)
+            ensure_model_loaded(model_name, side)
+
+            # Try one more time after recovery steps
+            try:
+                generated_text, model_id, stats = generate_text(model_name, prompt_text)
+            except Exception as retry_err:
+                stop_event.set()
+                watcher.join(timeout=1.0)
+                _set_widget_message(text_widget, f"Error after recovery attempt: {retry_err}", side=side, error=True)
+                return
+
+            # Stop watcher on success
+            stop_event.set()
+            watcher.join(timeout=1.0)
+
+        except Exception as e:
+            stop_event.set()
+            watcher.join(timeout=1.0)
+            print(f"Recovery failed for {model_name}: {e}")
+            _set_widget_message(text_widget, f"Error during recovery: {e}", side=side, error=True)
             return
-        
-        if generated_text:
-            response_content[side] = generated_text
-            show_formatted[side] = True
-            button = button_left if side == "left" else button_right
-            button.config(text="Show Raw")
-            format_markdown(text_widget, generated_text)
-        else:
-            text_widget.config(state=tk.NORMAL)
-            text_widget.delete(1.0, tk.END)
-            text_widget.insert(tk.END, f"Error: No response from {model_name}")
-            text_widget.config(state=tk.DISABLED)
-    except Exception as e:
-        print(f"Error generating text from {model_name}: {e}")
-        text_widget.config(state=tk.NORMAL)
-        text_widget.delete(1.0, tk.END)
-        text_widget.insert(tk.END, f"Error: {e}")
-        text_widget.config(state=tk.DISABLED)
+
+    # At this point we have generated_text/model_id (or generated_text may be None)
+    # Verify the response came from the correct model
+    if model_id != expected_model_id:
+        msg = f"Error: Response mismatch. Expected {expected_model_id}, got {model_id}"
+        print(f"Warning: Response for {side} came from {model_id}, expected {expected_model_id}")
+        _set_widget_message(text_widget, msg, side=side, error=True)
+        return
+
+    if generated_text:
+        # Append stats if available
+        try:
+            if stats:
+                stats_block = "\n\n**Stats**:\n```json\n" + json.dumps(stats, indent=2) + "\n```\n"
+                display_text = (generated_text or "") + stats_block
+            else:
+                display_text = generated_text
+        except Exception:
+            display_text = generated_text
+
+        _set_widget_message(text_widget, display_text, side=side, error=False)
+    else:
+        _set_widget_message(text_widget, f"Error: No response from {model_name}", side=side, error=True)
 
 def on_dropdown_left_change(value):
     """Handle left dropdown selection."""
@@ -319,10 +422,8 @@ def main(event=None):
     # Clear input field
     prompt_entry.delete(1.0, tk.END)
     
-    # Ensure models are loaded and get their instance IDs
-    ensure_model_loaded(model1_name, "left")
-    ensure_model_loaded(model2_name, "right")
-    
+    # Do not pre-check or load models here — workers will send the prompt
+    # immediately and only pivot to loading/unloading on errors.
     model1_id = model_instances["left"] or model1_name
     model2_id = model_instances["right"] or model2_name
     
@@ -356,16 +457,21 @@ generate_button.pack()
 content_frame = tk.Frame(root, bg=BG_COLOR)
 content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+# Configure equal weights for left and right frames
+content_frame.grid_columnconfigure(0, weight=1)
+content_frame.grid_columnconfigure(1, weight=1)
+content_frame.grid_rowconfigure(0, weight=1)
+
 # Left side
 left_frame = tk.Frame(content_frame, bg=BG_COLOR)
-left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
 tk.Label(left_frame, text="Select Model (Left):", bg=BG_COLOR, fg=FG_COLOR).pack(anchor=tk.NW)
-dropdown_left_var = tk.StringVar(value=available_models[0])
+dropdown_left_var = tk.StringVar(value=available_models[2])
 dropdown_left = tk.OptionMenu(left_frame, dropdown_left_var, *available_models, command=on_dropdown_left_change)
 dropdown_left.config(bg=BUTTON_COLOR, fg=BUTTON_FG, activebackground="#1565c0", activeforeground=BUTTON_FG, relief=tk.FLAT, bd=0, highlightthickness=0, padx=8, pady=6)
 dropdown_left.pack(fill=tk.X, pady=(0, 10))
-selected_models["left"] = 0
+selected_models["left"] = 2
 
 left_output_frame = tk.Frame(left_frame, bg=BG_COLOR)
 left_output_frame.pack(fill=tk.BOTH, expand=True)
@@ -381,7 +487,7 @@ text_left.pack(fill=tk.BOTH, expand=True)
 
 # Right side
 right_frame = tk.Frame(content_frame, bg=BG_COLOR)
-right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
 tk.Label(right_frame, text="Select Model (Right):", bg=BG_COLOR, fg=FG_COLOR).pack(anchor=tk.NW)
 dropdown_right_var = tk.StringVar(value=available_models[1])
